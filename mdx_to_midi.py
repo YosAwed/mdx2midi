@@ -39,7 +39,7 @@ class MDXFormatError(Exception):
     pass
 
 class MDXtoMIDI:
-    def __init__(self, mdx_file, midi_file, max_loops=2, verbose=False):
+    def __init__(self, mdx_file, midi_file, max_loops=2, verbose=False, force=False):
         """
         MDXからMIDIへの変換クラスを初期化
         
@@ -48,6 +48,7 @@ class MDXtoMIDI:
             midi_file (str): 出力MIDIファイルのパス
             max_loops (int): ループの最大繰り返し回数
             verbose (bool): 詳細なログ出力を有効にするかどうか
+            force (bool): 強制モード（非標準フォーマット対応）
         """
         self.mdx_file = mdx_file
         self.midi_file = midi_file
@@ -58,6 +59,8 @@ class MDXtoMIDI:
         self.time = 0
         self.max_loops = max_loops
         self.verbose = verbose
+        self.force = force
+        self.is_shift_jis = True  # 文字コード
         
         if verbose:
             logging.getLogger().setLevel(logging.DEBUG)
@@ -85,8 +88,30 @@ class MDXtoMIDI:
         title_ptr = struct.unpack("<H", data[0:2])[0]
         voice_ptr = struct.unpack("<H", data[2:4])[0]
         
-        if title_ptr < 7 or voice_ptr < 7:
-            raise MDXFormatError("無効なポインタ値です。MDXフォーマットが正しくありません。")
+        # ファイル形式の特定を試みる
+        # 一部のMDXファイルはフォーマットが異なる場合がある
+        if title_ptr > 0x1000 or voice_ptr > 0x1000:
+            # ポインタ値が大きすぎる場合、別のフォーマットの可能性がある
+            logger.warning(f"異常なポインタ値を検出: タイトル={title_ptr:04X}h, 音色={voice_ptr:04X}h")
+            
+            if self.force:
+                logger.warning("強制モードが有効なため、処理を続行します")
+                # デフォルト値を使用
+                self.is_shift_jis = False  # 文字コードを変更
+                return True
+            else:
+                raise MDXFormatError(f"無効なポインタ値です。MDXフォーマットが正しくありません。強制モードで実行するには -f オプションを使用してください。")
+        
+        # トラック数の確認
+        num_tracks = data[6]
+        if num_tracks == 0 or num_tracks > 16 * 2:  # 合理的な範囲を設定
+            logger.warning(f"無効なトラック数です: {num_tracks}")
+            
+            if self.force:
+                logger.warning(f"強制モードが有効なため、トラック数を{16}に制限します")
+                return True
+            else:
+                raise MDXFormatError(f"無効なトラック数です: {num_tracks}\n強制モードで実行するには -f オプションを使用してください。")
             
         return True
         
@@ -109,45 +134,117 @@ class MDXtoMIDI:
             voice_ptr = struct.unpack("<H", data[2:4])[0]
             
             # タイトル取得
-            title_end = data.find(b'\x00', title_ptr)
-            if title_end == -1:  # 終端が見つからない場合
-                title_end = voice_ptr  # ボイスデータの開始位置まで
-                
-            title = data[title_ptr:title_end].decode('shift-jis', errors='ignore')
-            logger.info(f"曲名: {title}")
+            try:
+                title_end = data.find(b'\x00', title_ptr)
+                if title_end == -1:  # 終端が見つからない場合
+                    title_end = min(voice_ptr, title_ptr + 50)  # ボイスデータの開始位置まで、または最大長を制限
+                    
+                if title_ptr < len(data) and title_end <= len(data) and title_end > title_ptr:
+                    encoding = 'shift_jis' if self.is_shift_jis else 'ascii'
+                    title = data[title_ptr:title_end].decode(encoding, errors='ignore')
+                    logger.info(f"曲名: {title}")
+                else:
+                    logger.warning("タイトルの取得に失敗しました")
+                    title = "不明"
+            except Exception as e:
+                logger.warning(f"タイトルの取得中にエラーが発生しました: {e}")
+                title = "不明"
             
             # トラック数と各トラックのオフセット取得
             if len(data) <= 6:
                 raise MDXFormatError("ファイルが短すぎます。トラック情報が含まれていません。")
                 
-            num_tracks = struct.unpack("<B", data[6:7])[0]
-            if num_tracks == 0 or num_tracks > 16:
-                raise MDXFormatError(f"無効なトラック数です: {num_tracks}")
+            num_tracks = data[6]
+            if num_tracks == 0 or num_tracks > 16 * 2:
+                if self.force:
+                    logger.warning(f"無効なトラック数({num_tracks})を{16}に制限します")
+                    num_tracks = 16
+                else:
+                    raise MDXFormatError(f"無効なトラック数です: {num_tracks}")
                 
             logger.info(f"トラック数: {num_tracks}")
             
+            # 特殊なファイル形式の検出と対応
+            # 一部のMDXファイルでは、ヘッダー部分が異なるフォーマットを使用している可能性がある
+            if num_tracks > 16 and self.force:
+                # 強制モードでは、ファイルの内容を分析して有効なトラックを探す
+                logger.warning("非標準のMDXフォーマットを検出しました。強制モードで解析を試みます。")
+                
+                # ファイルの先頭から有効なMDXデータを探す
+                potential_offsets = []
+                for i in range(0, min(0x100, len(data)-2), 2):
+                    offset = struct.unpack("<H", data[i:i+2])[0]
+                    if 0x10 <= offset < len(data) - 10:  # 合理的なオフセット範囲
+                        potential_offsets.append((i, offset))
+                
+                if potential_offsets:
+                    # 最も可能性の高いオフセット位置を選択
+                    best_offset_pos = potential_offsets[0][0]
+                    track_count_pos = best_offset_pos + 6  # 標準MDXフォーマットに基づく推測
+                    
+                    if track_count_pos < len(data):
+                        num_tracks = min(data[track_count_pos], 16)
+                        logger.info(f"推定トラック数: {num_tracks}")
+                    else:
+                        num_tracks = 1  # デフォルト値
+                        logger.warning("トラック数を推定できません。デフォルト値を使用します。")
+            
             track_offsets = []
-            for i in range(num_tracks):
+            for i in range(min(num_tracks, 16)):  # 最大トラック数を制限
                 if 7 + i*2 + 1 >= len(data):
-                    raise MDXFormatError(f"トラック{i+1}のオフセット情報が欠落しています")
+                    logger.warning(f"トラック{i+1}のオフセット情報が欠落しています")
+                    break
                     
                 offset = struct.unpack("<H", data[7 + i*2:9 + i*2])[0]
-                track_offsets.append(offset)
                 
                 if offset >= len(data):
-                    raise MDXFormatError(f"トラック{i+1}のオフセット({offset})がファイルサイズを超えています")
+                    logger.warning(f"トラック{i+1}のオフセット({offset})がファイルサイズを超えています")
+                    if self.force:
+                        continue  # このトラックをスキップ
+                    else:
+                        raise MDXFormatError(f"トラック{i+1}のオフセット({offset})がファイルサイズを超えています")
+                
+                track_offsets.append(offset)
+            
+            if not track_offsets:
+                logger.warning("有効なトラックが見つかりませんでした")
+                if not self.force:
+                    raise MDXFormatError("有効なトラックが見つかりません")
+                else:
+                    # 強制モードでは、ファイルの内容から有効なトラックデータを探す試み
+                    for i in range(0, min(len(data)-100, 0x1000), 0x100):
+                        if i + 100 < len(data):
+                            # 典型的なMDXコマンドパターンを探す
+                            if any(cmd in data[i:i+100] for cmd in [MDX_CMD_TEMPO, MDX_CMD_VOLUME, MDX_CMD_INSTRUMENT]):
+                                logger.info(f"オフセット0x{i:04X}で潜在的なトラックデータを検出しました")
+                                track_offsets.append(i)
+                                break
+            
+            # 少なくとも1つのトラックが必要
+            if not track_offsets and self.force:
+                logger.warning("トラックが見つからないため、デフォルトオフセットを使用します")
+                if len(data) > 100:
+                    track_offsets.append(100)  # 適当なオフセット
             
             # 各トラックを解析
             for track_num, offset in enumerate(track_offsets):
-                if track_num >= 16:  # MIDIは最大16トラック
-                    logger.warning(f"トラック数が16を超えています。トラック{track_num+1}以降は無視されます。")
+                if track_num >= 16:  # MIDIは最大トラック数を制限
+                    logger.warning(f"トラック数が{16}を超えています。トラック{track_num+1}以降は無視されます。")
                     break
                     
                 logger.info(f"トラック {track_num+1} の解析中...")
-                self.parse_track(data, offset, track_num)
+                try:
+                    self.parse_track(data, offset, track_num)
+                except Exception as e:
+                    logger.error(f"トラック{track_num+1}の解析中にエラーが発生しました: {e}")
+                    if not self.force:
+                        raise
                 
         except struct.error as e:
-            raise MDXFormatError(f"データ構造の解析に失敗しました: {e}")
+            error_msg = f"データ構造の解析に失敗しました: {e}"
+            logger.error(error_msg)
+            if not self.force:
+                raise MDXFormatError(error_msg)
         except UnicodeDecodeError as e:
             logger.warning(f"タイトルの文字コード変換に失敗しました: {e}")
     
@@ -465,6 +562,7 @@ def main():
     parser.add_argument("-o", "--output", default=None, help="出力MIDIファイル名（デフォルトは入力ファイル名.mid）")
     parser.add_argument("-l", "--loops", type=int, default=2, help="ループの最大繰り返し回数（0=ループなし、デフォルト=2）")
     parser.add_argument("-v", "--verbose", action="store_true", help="詳細なログ出力を有効にする")
+    parser.add_argument("-f", "--force", action="store_true", help="強制モード（非標準フォーマット対応）")
     
     args = parser.parse_args()
     
@@ -476,7 +574,7 @@ def main():
     
     try:
         # 変換処理の実行
-        converter = MDXtoMIDI(args.mdx_file, midi_file, args.loops, args.verbose)
+        converter = MDXtoMIDI(args.mdx_file, midi_file, args.loops, args.verbose, args.force)
         converter.read_mdx()
         converter.save_midi()
         logger.info("変換が完了しました。")
