@@ -516,10 +516,19 @@ class MDXtoMIDI:
                         # 多くの拡張コマンドは可変長のため、安全に処理できない
                         # 最も一般的なパターンとして1バイトをスキップ
                         skip_bytes = 1
-                    else:
-                        # 未知のコマンド - 安全のため1バイトのみスキップ
-                        logger.warning(f"未知のコマンド: 0x{cmd:02X} at pos {pos-1}")
+                    # 88ST_AR.MDXで検出された未知のコマンドに対応
+                    elif cmd == 0xF1 or cmd == 0xF3 or cmd == 0xF5 or cmd == 0xF6 or cmd == 0xF7 or cmd == 0xFB or cmd == 0xFC or cmd == 0xFD or cmd == 0xFE or cmd == 0xFF:
+                        # これらの未知のコマンドは1バイトをスキップ
                         skip_bytes = 1
+                        # 詳細ログモードの場合のみ出力
+                        if self.verbose:
+                            logger.debug(f"未対応のコマンドをスキップ: 0x{cmd:02X} at pos {pos-1}")
+                    else:
+                        # その他の未知のコマンド - 安全のため1バイトのみスキップ
+                        skip_bytes = 1
+                        # 詳細ログモードの場合のみ出力
+                        if self.verbose:
+                            logger.debug(f"未知のコマンド: 0x{cmd:02X} at pos {pos-1}")
                     
                     # バッファ境界チェック
                     if pos + skip_bytes > len(data):
