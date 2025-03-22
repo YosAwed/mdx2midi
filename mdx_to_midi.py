@@ -199,23 +199,18 @@ class MDXtoMIDI:
             # ポインタ値の妥当性確認（改良版）
             file_size = os.path.getsize(self.mdx_file)
             
+            # ポインタ値が小さすぎる場合もエラーとする
+            min_valid_ptr = 7 + (2 * data[6])  # ヘッダーサイズ + トラックポインタサイズ
+            
+            if title_ptr < min_valid_ptr or voice_ptr < min_valid_ptr:
+                logger.warning(f"ポインタ値が小さすぎます: タイトル={title_ptr:04X}h, 音色={voice_ptr:04X}h")
+                if not self.force:
+                    raise MDXFormatError("ポインタ値が小さすぎます。有効なMDXファイルではありません。")
+            
             if title_ptr > file_size or voice_ptr > file_size:
                 logger.warning(f"ポインタがファイルサイズを超えています: タイトル={title_ptr:04X}h, 音色={voice_ptr:04X}h")
                 if not self.force:
                     raise MDXFormatError("ポインタ値がファイルサイズを超えています")
-            
-            # ファイル形式の特定を試みる（改良版）
-            # 一部のMDXファイルはフォーマットが異なる場合がある
-            if title_ptr > 0x1000 or voice_ptr > 0x1000:
-                # ポインタ値が大きすぎる場合、別のフォーマットの可能性がある
-                logger.warning(f"異常なポインタ値を検出: タイトル={title_ptr:04X}h, 音色={voice_ptr:04X}h")
-                
-                if self.force:
-                    logger.warning("強制モードが有効なため、処理を続行します")
-                    # デフォルト値を使用
-                    self.is_shift_jis = False  # 文字コードを変更
-                else:
-                    raise MDXFormatError(f"無効なポインタ値です。MDXフォーマットが正しくありません。強制モードで実行するには -f オプションを使用してください。")
             
             # トラック数の確認（改良版）
             num_tracks = data[6]
